@@ -47,7 +47,7 @@ This project builds a fully working **face detection system** — no external ca
 ## ⚙️ How It Works
 
 ```
-[ Push Button Pressed ]
+[ ultrasonic sensor detects motion ]
         ↓
 [ ESP32-CAM Captures Image ]
         ↓
@@ -58,6 +58,9 @@ This project builds a fully working **face detection system** — no external ca
 [ Result Returned: Number of Faces + Confidence Values ]
         ↓
 [ Output Displayed on Serial Monitor ]
+       ↓
+[ the annotated image is sent ot whatsapp with details ]
+
 ```
 
 > **Tip:** For testing, you don't need a live subject — any image from the web with clearly visible faces will also work! Always ensure good lighting for best detection accuracy.
@@ -69,7 +72,7 @@ This project builds a fully working **face detection system** — no external ca
 | S.No | Component | Purpose |
 |------|-----------|---------|
 | 1 | ESP32-CAM | Microcontroller with built-in camera & Wi-Fi |
-| 2 | Push Button | Triggers image capture on press |
+| 2 | ultrasonic | Triggers image capture when motion is detected |
 | 3 | Breadboard | Simplifies and organizes circuit connections |
 | 4 | USB-to-Serial (FTDI) Adapter *(if needed)* | For programming standard ESP32-CAM without onboard USB |
 | 5 | USB Cable | Powers the system via laptop/PC |
@@ -82,20 +85,6 @@ This project builds a fully working **face detection system** — no external ca
 
 ---
 
-## 🔌 Circuit Diagram
-
-The push button is connected to **GPIO13** of the ESP32-CAM to trigger image capture.
-
-```
-ESP32-CAM            Push Button
----------            -----------
- GPIO13  ───────────  One Terminal
-  GND    ───────────  Other Terminal
-```
-
-> Connect the ESP32-CAM to your laptop via USB for power. Refer to the circuit diagram image in the repository for a visual reference.
-
----
 
 ## 🚀 Getting Started
 
@@ -136,116 +125,9 @@ const char* API_KEY    = "Your_API_Key_Here";
 7. Press the push button — the face detection result appears within seconds!
 
 ---
-
-## 💻 Code Explanation
-
-### 1. Library Includes
-
-```cpp
-#include "esp_camera.h"
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-
-WiFiClientSecure client;
-```
-
-Includes libraries for **ESP32 camera control**, **Wi-Fi connectivity**, and **secure HTTPS communication**. The `WiFiClientSecure` object enables encrypted data transfer between the ESP32 and the cloud server.
-
 ---
 
-### 2. Wi-Fi & API Configuration
 
-```cpp
-const char* WIFI_SSID  = "YourSSID";
-const char* WIFI_PASS  = "YourPassword";
-const char* API_KEY    = "YourAPIKey";
-const char* serverName = "www.circuitdigest.cloud";
-const char* serverPath = "/api/v1/face-detection/detect";
-const int   serverPort = 443;
-```
-
-Defines Wi-Fi credentials and the cloud API endpoint. The `serverPath` points to the **face detection model**. The API key is used for authentication on every request.
-
----
-
-### 3. Camera Pin Mapping
-
-```cpp
-#define PWDN_GPIO_NUM  32
-#define XCLK_GPIO_NUM   0
-#define Y2_GPIO_NUM     5
-#define Y3_GPIO_NUM    18
-#define Y9_GPIO_NUM    35
-#define PCLK_GPIO_NUM  22
-// ... (remaining pins)
-```
-
-Maps ESP32 GPIO pins to the camera module's data lines, clock, and synchronization signals. Correct pin mapping is essential for stable and accurate image capture.
-
----
-
-### 4. Camera Initialization
-
-```cpp
-void initCamera() {
-  camera_config_t cfg = {};
-  cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
-  cfg.jpeg_quality = 10;
-  cfg.fb_count     = 1;
-  if (esp_camera_init(&cfg) != ESP_OK) {
-    Serial.println("Camera init failed!");
-    while (1);
-  }
-}
-```
-
-Initializes the camera in **JPEG format** at **VGA resolution**. This balances transmission speed and image quality for reliable face detection. If initialization fails, the program halts execution to prevent further errors.
-
----
-
-### 5. Capture & Send to API
-
-```cpp
-camera_fb_t* fb = esp_camera_fb_get();
-
-if (!client.connect(serverName, serverPort)) {
-  Serial.println("Connection failed");
-  return;
-}
-
-client.println("POST " + String(serverPath) + " HTTP/1.1");
-client.println("X-API-Key: " + String(API_KEY));
-client.println("Content-Type: multipart/form-data");
-client.write(fb->buf, fb->len);
-
-esp_camera_fb_return(fb);
-```
-
-On button press, captures a JPEG image and transmits it to the CircuitDigest Cloud API via **HTTPS POST** in multipart form-data format. After sending, the frame buffer is released to free memory and prevent overflow.
-
----
-
-## 📊 Output
-
-After pressing the push button, the Serial Monitor displays:
-
-```
-Connecting to WiFi...
-WiFi Connected!
-Button Pressed - Capturing Image...
-Image Captured. Sending to API...
-
---- Face Detection Result ---
-Faces Detected: 3
-  Face 1 - Confidence: 98.5%
-  Face 2 - Confidence: 95.2%
-  Face 3 - Confidence: 89.7%
-```
-
-> The result includes the **total number of faces detected** and the **confidence score** for each individual face.
-
----
 
 ## ✅ Advantages & Limitations
 
