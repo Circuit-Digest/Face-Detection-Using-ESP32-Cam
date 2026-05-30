@@ -1,144 +1,596 @@
-
 #include "esp_camera.h"
+#include "esp_tls.h"
+#include "esp_crt_bundle.h"
+#include "esp_sntp.h"
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
-const char* WIFI_SSID  = "Yourssidname";
-const char* WIFI_PASS  = "YourWifiPassword";
-const char* API_KEY    = "Yourapikey";
-const char* serverName = "www.circuitdigest.cloud";
-const char* serverPath = "/api/v1/face-detection/detect";
-const int   serverPort = 443;
+// ─── User Config ──────────────────────────────────────────────────
+const char* WIFI_SSID = "Yourssidname";
+const char* WIFI_PASS = "yourwifipassword";
+const char* API_KEY   = "yourapikey";
+const char* PHONE     = "yourphonenumber";   // country code + number, no +
 
-#define TRIGGER_BTN 13
+// ─── Ultrasonic Pins ──────────────────────────────────────────────
+// NOTE: Do NOT use GPIO 12 or 13 — they are boot-strapping pins on
+//       ESP32-CAM and will cause a reboot loop when held HIGH/LOW.
+#define TRIG_PIN   14
+#define ECHO_PIN   15
+#define DETECT_CM  10       // trigger distance threshold
+#define COOLDOWN   8000UL   // ms between triggers
 
-#define PWDN_GPIO_NUM  32
-#define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM   0
-#define SIOD_GPIO_NUM  26
-#define SIOC_GPIO_NUM  27
-#define Y9_GPIO_NUM    35
-#define Y8_GPIO_NUM    34
-#define Y7_GPIO_NUM    39
-#define Y6_GPIO_NUM    36
-#define Y5_GPIO_NUM    21
-#define Y4_GPIO_NUM    19
-#define Y3_GPIO_NUM    18
-#define Y2_GPIO_NUM     5
-#define VSYNC_GPIO_NUM 25
-#define HREF_GPIO_NUM  23
-#define PCLK_GPIO_NUM  22
+// ─── Camera Pins (AI-Thinker ESP32-CAM) ──────────────────────────
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
 
-WiFiClientSecure client;
-unsigned long lastTrigger = 0;
+// ─── Globals ──────────────────────────────────────────────────────
+WebServer server(80);
 
-void initCamera() {
+static uint8_t* g_imgBuf     = nullptr;
+static size_t   g_imgLen     = 0;
+static char     g_status[64] = "Monitoring...";
+static char     g_imageUrl[256] = "";
+static char     g_jsonBuf[2048] = {};
+static int      g_faceCount  = 0;
+static char     g_capTime[64]= "N/A";
+
+static SemaphoreHandle_t g_startSem  = nullptr;
+static SemaphoreHandle_t g_doneSem   = nullptr;
+static SemaphoreHandle_t g_imgMutex  = nullptr; // FIX 9
+
+// ─── Heap Debug ───────────────────────────────────────────────────
+static void printHeap(const char* tag) {
+  Serial.printf("[HEAP] %s: free=%u largest=%u psram=%u\n", tag,
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getMaxAllocHeap(),
+    (unsigned)ESP.getFreePsram());
+}
+
+// ─── WiFi Reconnect ───────────────────────────────────────────────
+static void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("[WiFi] reconnecting");
+  WiFi.disconnect(true);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for (uint32_t t = millis(); WiFi.status() != WL_CONNECTED;) {
+    if (millis() - t > 20000) { Serial.println("\n[WiFi] timeout → reboot"); ESP.restart(); }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+  Serial.printf("\n[WiFi] %s\n", WiFi.localIP().toString().c_str());
+}
+
+// ─── Camera Init ──────────────────────────────────────────────────
+static bool initCamera() {
   camera_config_t cfg = {};
   cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
-  cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
-  cfg.pin_d2 = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
-  cfg.pin_d4 = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM;
-  cfg.pin_d6 = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
-  cfg.pin_xclk = XCLK_GPIO_NUM; cfg.pin_pclk = PCLK_GPIO_NUM;
-  cfg.pin_vsync = VSYNC_GPIO_NUM; cfg.pin_href = HREF_GPIO_NUM;
-  cfg.pin_sscb_sda = SIOD_GPIO_NUM; cfg.pin_sscb_scl = SIOC_GPIO_NUM;
-  cfg.pin_pwdn = PWDN_GPIO_NUM; cfg.pin_reset = RESET_GPIO_NUM;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM;
+  cfg.pin_d3=Y5_GPIO_NUM; cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM;
+  cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM;    cfg.pin_pclk=PCLK_GPIO_NUM;
+  cfg.pin_vsync=VSYNC_GPIO_NUM;  cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM;
+  cfg.pin_pwdn=PWDN_GPIO_NUM;    cfg.pin_reset=RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
-  cfg.jpeg_quality = 10;
-  cfg.fb_count     = 1;
-  if (esp_camera_init(&cfg) != ESP_OK) {
-    Serial.println("Camera init failed!"); while (1);
+  if (psramFound()) {                          // FIX 8
+    cfg.frame_size   = FRAMESIZE_VGA;
+    cfg.jpeg_quality = 12;
+    cfg.fb_count     = 2;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  } else {
+    cfg.frame_size   = FRAMESIZE_QVGA;
+    cfg.jpeg_quality = 15;
+    cfg.fb_count     = 1;
+    cfg.fb_location  = CAMERA_FB_IN_DRAM;
   }
-
+  esp_err_t e = esp_camera_init(&cfg);
+  if (e != ESP_OK) { Serial.printf("[CAM] init fail 0x%x\n", e); return false; }
   sensor_t* s = esp_camera_sensor_get();
-  s->set_brightness(s, 1);
-  s->set_contrast(s, 1);
-  s->set_saturation(s, 0);
-  s->set_whitebal(s, 1);
-  s->set_exposure_ctrl(s, 1);
-  s->set_gain_ctrl(s, 1);
-
-  Serial.println("Camera ready.");
+  if (s) {
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+  }
+  Serial.println("[CAM] ready");
+  return true;
 }
 
-void countFaces() {
-  Serial.println("Photo captured! Sending to API...");
+// ─── Ultrasonic ───────────────────────────────────────────────────
+static float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH, 25000);
+  if (dur == 0) return 999.0f;
+  return (dur * 0.034f) / 2.0f;
+}
 
-  // Warm-up frames
-  for (int i = 0; i < 3; i++) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    esp_camera_fb_return(fb);
-    delay(200);
-  }
+// ─── Capture Frame ────────────────────────────────────────────────
+static bool captureFrame() {
+  // FIX 6: discard one stale frame so AEC settles
+  camera_fb_t* wf = esp_camera_fb_get();
+  if (wf) esp_camera_fb_return(wf);
+  vTaskDelay(pdMS_TO_TICKS(400));
 
-  // Real frame
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { Serial.println("Capture failed"); return; }
+  if (!fb) { Serial.println("[CAM] capture failed"); return false; }
+  Serial.printf("[CAM] frame %u bytes\n", (unsigned)fb->len);
 
-  if (!client.connect(serverName, serverPort)) {
-    Serial.println("Connection failed"); esp_camera_fb_return(fb); return;
+  // FIX 9: lock before touching shared buffer
+  xSemaphoreTake(g_imgMutex, portMAX_DELAY);
+  if (g_imgBuf) { free(g_imgBuf); g_imgBuf = nullptr; }
+  g_imgLen = fb->len;
+
+  // FIX 8: PSRAM-aware allocation
+  if (psramFound() && ESP.getFreePsram() > g_imgLen + 8192)
+    g_imgBuf = (uint8_t*)ps_malloc(g_imgLen);
+  if (!g_imgBuf && ESP.getMaxAllocHeap() > g_imgLen + 32768)
+    g_imgBuf = (uint8_t*)malloc(g_imgLen);
+
+  if (!g_imgBuf) {
+    Serial.printf("[CAM] no memory (len=%u)\n", (unsigned)g_imgLen);
+    esp_camera_fb_return(fb);
+    xSemaphoreGive(g_imgMutex);
+    return false;
   }
-
-  String boundary = "----ESP32Boundary";
-  String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-  String tail = "\r\n--" + boundary + "--\r\n";
-  int contentLen = head.length() + fb->len + tail.length();
-
-  client.println("POST " + String(serverPath) + " HTTP/1.1");
-  client.println("Host: " + String(serverName));
-  client.println("X-API-Key: " + String(API_KEY));
-  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client.println("Content-Length: " + String(contentLen));
-  client.println("Connection: close");
-  client.println();
-  client.print(head);
-  client.write(fb->buf, fb->len);
-  client.print(tail);
+  memcpy(g_imgBuf, fb->buf, g_imgLen);
   esp_camera_fb_return(fb);
+  xSemaphoreGive(g_imgMutex);
 
-  // Wait & read response
-  long t = millis();
-  while (!client.available()) { if (millis() - t > 15000) { client.stop(); return; } }
-  String res = "";
-  while (client.available()) res += (char)client.read();
-  client.stop();
+  // Save capture timestamp
+  struct tm ti;
+  if (getLocalTime(&ti, 500))
+    strftime(g_capTime, sizeof(g_capTime), "%I:%M %p, %B %d, %Y", &ti);
+  else
+    snprintf(g_capTime, sizeof(g_capTime), "uptime %lus", millis() / 1000);
 
-  // Extract JSON
-  int j = res.indexOf("\r\n\r\n");
-  String json = (j != -1) ? res.substring(j + 4) : res;
-  Serial.println("Response: " + json);
-
-  // Parse face count
-  int faceIdx = json.indexOf("\"face_count\":");
-  int faceCount = 0;
-  if (faceIdx != -1) {
-    faceCount = json.substring(faceIdx + 13, faceIdx + 15).toInt();
-  }
-
-  Serial.println("Faces detected: " + String(faceCount));
-
-  if      (faceCount == 0) Serial.println("Status: No faces detected.");
-  else if (faceCount == 1) Serial.println("Status: 1 person detected.");
-  else                     Serial.println("Status: " + String(faceCount) + " persons detected.");
+  return true;
 }
 
+// ─── TLS Helpers (ported from reference) ─────────────────────────
+static bool tlsWriteAll(esp_tls_t* tls, const uint8_t* buf, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    int n = esp_tls_conn_write(tls, buf + sent, len - sent);
+    if (n < 0) { Serial.printf("[TLS] write err %d\n", n); return false; }
+    sent += n;
+    if (sent % 4096 == 0) vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  return true;
+}
+
+static size_t tlsReadAll(esp_tls_t* tls, char* buf, size_t maxLen) {
+  size_t total = 0;
+  uint32_t t = millis();
+  while (total < maxLen - 1) {
+    if (millis() - t > 10000) break;
+    int n = esp_tls_conn_read(tls, buf + total, maxLen - 1 - total);
+    if (n == 0) break;
+    if (n == ESP_TLS_ERR_SSL_WANT_READ) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+    if (n < 0) break;
+    total += n; t = millis();
+  }
+  buf[total] = '\0';
+  return total;
+}
+
+static void skipHeaders(char* resp, size_t len, size_t* bodyStart) {
+  *bodyStart = 0;
+  for (size_t i = 0; i + 3 < len; i++) {
+    if (resp[i]=='\r'&&resp[i+1]=='\n'&&resp[i+2]=='\r'&&resp[i+3]=='\n') {
+      *bodyStart = i + 4; return;
+    }
+  }
+}
+
+static esp_tls_t* openTLS(const char* host, int port) {
+  esp_tls_cfg_t cfg = {};
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.non_block = false;
+  for (int i = 0; i < 3; i++) {
+    esp_tls_t* tls = esp_tls_init();
+    if (!tls) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    if (esp_tls_conn_new_sync(host, strlen(host), port, &cfg, tls) == 1) return tls;
+    Serial.printf("[TLS] attempt %d failed\n", i + 1);
+    esp_tls_conn_destroy(tls);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+  }
+  return nullptr;
+}
+
+// ─── Face Detection API (FIX 1 — was a stub) ─────────────────────
+static bool detectFaces() {
+  printHeap("detectFaces");
+  const char* host = "www.circuitdigest.cloud";
+  const char* bnd  = "----ESP32Bound";
+
+  // Build multipart headers
+  char partHead[256];
+  int phLen = snprintf(partHead, sizeof(partHead),
+    "--%s\r\nContent-Disposition: form-data; name=\"imageFile\"; "
+    "filename=\"snap.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n", bnd);
+  char partTail[64];
+  int ptLen = snprintf(partTail, sizeof(partTail), "\r\n--%s--\r\n", bnd);
+
+  xSemaphoreTake(g_imgMutex, portMAX_DELAY);
+  size_t  imgLen = g_imgLen;
+  uint8_t* imgBuf = g_imgBuf;
+  size_t contentLen = phLen + imgLen + ptLen;
+
+  char reqHdr[512];
+  int reqLen = snprintf(reqHdr, sizeof(reqHdr),
+    "POST /api/v1/face-detection/detect HTTP/1.1\r\n"
+    "Host: %s\r\nX-API-Key: %s\r\n"
+    "Content-Type: multipart/form-data; boundary=%s\r\n"
+    "Content-Length: %u\r\nConnection: close\r\n\r\n",
+    host, API_KEY, bnd, (unsigned)contentLen);
+
+  esp_tls_t* tls = openTLS(host, 443);
+  if (!tls) { xSemaphoreGive(g_imgMutex); return false; }
+
+  bool ok =
+    tlsWriteAll(tls, (const uint8_t*)reqHdr,   reqLen) &&
+    tlsWriteAll(tls, (const uint8_t*)partHead, phLen)  &&
+    tlsWriteAll(tls, imgBuf, imgLen)                    &&
+    tlsWriteAll(tls, (const uint8_t*)partTail, ptLen);
+
+  xSemaphoreGive(g_imgMutex);
+
+  static char respBuf[3072];
+  if (ok) tlsReadAll(tls, respBuf, sizeof(respBuf));
+  esp_tls_conn_destroy(tls);
+  if (!ok) return false;
+
+  // Extract JSON body
+  size_t bodyStart = 0, respLen = strlen(respBuf);
+  skipHeaders(respBuf, respLen, &bodyStart);
+  size_t bodyLen = respLen - bodyStart;
+  if (bodyLen >= sizeof(g_jsonBuf)) bodyLen = sizeof(g_jsonBuf) - 1;
+  memcpy(g_jsonBuf, respBuf + bodyStart, bodyLen);
+  g_jsonBuf[bodyLen] = '\0';
+
+  // Strip chunked transfer-encoding size prefix if present
+  char* s = g_jsonBuf;
+  while (*s && ((*s>='0'&&*s<='9')||(*s>='a'&&*s<='f')||(*s>='A'&&*s<='F'))) s++;
+  if (s != g_jsonBuf && *s == '\r') { s += 2; memmove(g_jsonBuf, s, strlen(s) + 1); }
+
+  Serial.printf("[API] %s\n", g_jsonBuf);
+  return g_jsonBuf[0] != '\0';
+}
+
+// ─── Parse Face Result (FIX 2 — was completely missing) ──────────
+static void parseFaceResult() {
+  const char* j = g_jsonBuf;
+
+  // Extract image_url
+  g_imageUrl[0] = '\0';
+  const char* url_key = "\"image_url\":\"";
+  const char* ui = strstr(j, url_key);
+  if (ui) {
+    const char* vs = ui + strlen(url_key);
+    const char* ve = strchr(vs, '"');
+    if (ve && ve > vs) {
+      size_t len = ve - vs;
+      if (len >= sizeof(g_imageUrl)) len = sizeof(g_imageUrl) - 1;
+      strncpy(g_imageUrl, vs, len);
+      g_imageUrl[len] = '\0';
+      // Unescape \/ → /
+      char* p = g_imageUrl, *q = g_imageUrl;
+      while (*p) {
+        if (*p == '\\' && *(p+1) == '/') p++;
+        *q++ = *p++;
+      }
+      *q = '\0';
+      Serial.printf("[DEBUG] Image URL: %s\n", g_imageUrl);
+    }
+  }
+
+  // Extract face_count
+  g_faceCount = 0;
+  const char* fc = strstr(j, "\"face_count\":");
+  if (fc) g_faceCount = atoi(fc + 13);
+
+  // Build human-readable status
+  if (g_faceCount == 0)
+    strncpy(g_status, "No Faces Detected",              sizeof(g_status));
+  else if (g_faceCount == 1)
+    strncpy(g_status, "1 Face Detected",                sizeof(g_status));
+  else
+    snprintf(g_status, sizeof(g_status), "%d Faces Detected", g_faceCount);
+
+  Serial.printf("[RESULT] %s\n", g_status);
+}
+
+// ─── WhatsApp (FIX 3 — was missing entirely) ──────────────────────
+static void sendWhatsApp() {
+  printHeap("sendWhatsApp");
+  const char* host = "www.circuitdigest.cloud";
+
+  char reqBody[1024];
+  int bodyLen = snprintf(reqBody, sizeof(reqBody),
+    "{"
+      "\"phone_number\":\"%s\","
+      "\"template_id\":\"image_capture_alert\","
+      "\"variables\":{"
+        "\"event_type\":\"%s\","
+        "\"location\":\"Entrance\","
+        "\"device_name\":\"ESP32-CAM Face Detector\","
+        "\"captured_time\":\"%s\","
+        "\"image_link\":\"%s\""
+      "}"
+    "}",
+    PHONE, g_status, g_capTime, g_imageUrl);
+
+  Serial.printf("[DEBUG] WA Payload: %s\n", reqBody);
+
+  char reqHdr[512];
+  int reqLen = snprintf(reqHdr, sizeof(reqHdr),
+    "POST /api/v1/whatsapp/send HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Authorization: %s\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: %u\r\n"
+    "Connection: close\r\n\r\n",
+    host, API_KEY, (unsigned)bodyLen);
+
+  esp_tls_t* tls = openTLS(host, 443);
+  if (!tls) { Serial.println("[WA] TLS open failed"); return; }
+
+  tlsWriteAll(tls, (const uint8_t*)reqHdr,  reqLen);
+  tlsWriteAll(tls, (const uint8_t*)reqBody, bodyLen);
+
+  static char respBuf[1024];
+  tlsReadAll(tls, respBuf, sizeof(respBuf));
+  esp_tls_conn_destroy(tls);
+
+  char* nl = strchr(respBuf, '\n');
+  if (nl) *nl = '\0';
+  Serial.printf("[WA] %s\n", respBuf);
+}
+
+// ─── Network Task on Core 0 ───────────────────────────────────────
+static void networkTask(void* /*arg*/) {
+  Serial.println("[NET] task started on Core 0");
+  for (;;) {
+    xSemaphoreTake(g_startSem, portMAX_DELAY);
+    ensureWiFi();
+
+    bool ok = detectFaces();
+    if (ok) parseFaceResult();
+    else    strncpy(g_status, "Detection Failed", sizeof(g_status));
+
+    Serial.printf("[STATUS] %s\n", g_status);
+
+    // Only notify when at least one face was detected
+    if (ok && g_faceCount > 0) {
+      Serial.printf("[WA] %d face(s) found — sending notification\n", g_faceCount);
+      sendWhatsApp();
+    } else {
+      Serial.println("[WA] No faces — notification skipped");
+    }
+
+    xSemaphoreGive(g_doneSem);
+  }
+}
+
+// ─── Web Server Handlers (FIX 5 — stream fixed) ──────────────────
+void handleRoot() {
+  String page =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta http-equiv='refresh' content='5'>"
+    "<title>ESP32 Face Detection</title>"
+    "<style>"
+    "body{background:#111;color:#ccc;font-family:monospace;padding:16px;margin:0}"
+    "h2{color:#0cf;margin:0 0 12px}"
+    ".card{background:#1a1a1a;border:1px solid #333;border-radius:8px;"
+           "padding:14px;margin-bottom:12px}"
+    ".big{font-size:1.4em;font-weight:bold;color:#0f0}"
+    "img{width:100%;border-radius:6px;border:1px solid #333}"
+    ".dim{color:#555;font-size:.75em;margin-top:10px}"
+    "</style></head><body>"
+    "<h2>ESP32-CAM Face Detection</h2>"
+    "<div class='card'>"
+    "<div style='color:#888;font-size:.8em'>STATUS</div>"
+    "<div class='big'>" + String(g_status) + "</div>"
+    "</div>"
+    "<div class='card'>"
+    "<div style='color:#888;font-size:.8em'>FACES DETECTED</div>"
+    "<div class='big'>" + String(g_faceCount) + "</div>"
+    "</div>"
+    "<div class='card'>"
+    "<div style='color:#888;font-size:.8em'>LAST CAPTURE</div>"
+    "<div>" + String(g_capTime) + "</div>"
+    "</div>"
+    "<div class='card'>"
+    "<div style='color:#888;font-size:.8em'>LIVE STREAM</div><br>"
+    "<img src='/stream' onerror=\"setTimeout(()=>this.src='/stream?t='+Date.now(),2000)\">"
+    "</div>"
+    "<p class='dim'>Auto-refresh 5s</p>"
+    "</body></html>";
+
+  server.send(200, "text/html", page);
+}
+
+// FIX 5: stream directly over the raw WiFiClient, not server.sendContent()
+void handleStream() {
+  WiFiClient streamClient = server.client();
+
+  streamClient.print(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n\r\n");
+
+  const uint32_t FRAME_GAP_MS = 80;   // ~12 fps
+  const uint32_t WATCHDOG_MS  = 8000; // reset if no frame sent for 8 s
+  uint32_t lastFrame = millis();
+
+  while (streamClient.connected()) {
+    if (millis() - lastFrame > WATCHDOG_MS) {
+      Serial.println("[STREAM] watchdog timeout");
+      break;
+    }
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+
+    streamClient.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+    streamClient.print(fb->len);
+    streamClient.print("\r\n\r\n");
+    size_t written = streamClient.write(fb->buf, fb->len);
+    streamClient.print("\r\n");
+    esp_camera_fb_return(fb);
+
+    if (written == 0) { Serial.println("[STREAM] write 0 — client gone"); break; }
+    lastFrame = millis();
+    vTaskDelay(pdMS_TO_TICKS(FRAME_GAP_MS));
+  }
+
+  streamClient.stop();
+  Serial.println("[STREAM] client disconnected");
+}
+
+// Web server task runs on Core 1 (same core as loop)
+void webTask(void* /*arg*/) {
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+// ─── Setup ────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  pinMode(TRIGGER_BTN, INPUT_PULLUP);
-  initCamera();
-  client.setInsecure();
+  vTaskDelay(pdMS_TO_TICKS(300));
+  Serial.println("\n=== ESP32-CAM Face Detection ===");
+
+  // Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Camera
+  if (!initCamera()) {
+    Serial.println("[CAM] fatal — check wiring");
+    while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+  // FIX 9: create mutex before any task can use the buffer
+  g_imgMutex = xSemaphoreCreateMutex();
+
+  // FIX 7: create semaphores BEFORE spawning the network task
+  g_startSem = xSemaphoreCreateBinary();
+  g_doneSem  = xSemaphoreCreateBinary();
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi");
-  while (!WiFi.isConnected()) { delay(500); Serial.print("."); }
-  Serial.println("\nConnected: " + WiFi.localIP().toString());
+  Serial.print("[WiFi] connecting");
+  for (uint32_t t = millis(); WiFi.status() != WL_CONNECTED;) {
+    if (millis() - t > 30000) { Serial.println("\ntimeout → reboot"); ESP.restart(); }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+  Serial.printf("\n[WiFi] %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[WEB]  http://%s/\n", WiFi.localIP().toString().c_str());
+
+  // FIX 4: NTP for IST timestamps
+  esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, "pool.ntp.org");
+  esp_sntp_setservername(1, "time.nist.gov");
+  esp_sntp_init();
+  setenv("TZ", "IST-5:30", 1);
+  tzset();
+  Serial.print("[NTP] syncing");
+  for (int i = 0; i < 20 && sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED; i++) {
+    vTaskDelay(pdMS_TO_TICKS(500)); Serial.print(".");
+  }
+  Serial.println(sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED ? " OK" : " (timeout)");
+
+  // Web server routes
+  server.on("/",       handleRoot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.begin();
+  Serial.println("[WEB] server started");
+
+  // FIX 7: network task on Core 0 (WiFi stack lives on Core 0)
+  xTaskCreatePinnedToCore(networkTask, "net_task", 8192, nullptr, 5, nullptr, 0);
+  // Web task on Core 1 alongside loop()
+  xTaskCreatePinnedToCore(webTask,     "web_task", 4096, nullptr, 3, nullptr, 1);
+
+  printHeap("setup complete");
+  Serial.println("[READY] Watching for objects < " + String(DETECT_CM) + " cm");
 }
 
+// ─── Main Loop — Ultrasonic polling ──────────────────────────────
 void loop() {
-  if (digitalRead(TRIGGER_BTN) == LOW && millis() - lastTrigger > 500) {
-    lastTrigger = millis();
-    Serial.println("Button pressed! Capturing image...");
-    countFaces();
+  static unsigned long lastTrigger = 0;
+  static bool networkBusy = false;
+
+  float dist = getDistance();
+
+  // Print distance only when it changes meaningfully (reduces serial spam)
+  static float lastPrinted = -1;
+  if (fabs(dist - lastPrinted) > 2.0f && dist < 200.0f) {
+    Serial.printf("[US] %.1f cm\n", dist);
+    lastPrinted = dist;
   }
+
+  if (dist < (float)DETECT_CM && !networkBusy &&
+      millis() - lastTrigger > COOLDOWN) {
+    lastTrigger = millis();
+    Serial.printf("\n[TRIGGER] %.1f cm — capturing\n", dist);
+    printHeap("before capture");
+
+    if (captureFrame()) {
+      printHeap("after capture");
+      networkBusy = true;
+      strncpy(g_status, "Detecting...", sizeof(g_status));
+
+      xSemaphoreGive(g_startSem);
+
+      // Wait for network task to finish, keep web server alive
+      uint32_t tWait = millis();
+      while (xSemaphoreTake(g_doneSem, pdMS_TO_TICKS(50)) != pdTRUE) {
+        if (millis() - tWait > 35000) {
+          Serial.println("[LOOP] network timeout — continuing");
+          break;
+        }
+      }
+      networkBusy = false;
+      Serial.printf("[LOOP] done: %s\n", g_status);
+    }
+  }
+
+  delay(100);
 }
